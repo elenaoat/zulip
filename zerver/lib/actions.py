@@ -282,13 +282,13 @@ def add_new_user_history(user_profile, streams):
     """Give you the last 1000 messages on your public streams, so you have
     something to look at in your home view once you finish the
     tutorial."""
-    one_week_ago = timezone_now() - datetime.timedelta(weeks=1)
+    # one_week_ago = timezone_now() - datetime.timedelta(weeks=1)
     recipients = Recipient.objects.filter(type=Recipient.STREAM,
                                           type_id__in=[stream.id for stream in streams
                                                        if not stream.invite_only])
-    recent_messages = Message.objects.filter(recipient_id__in=recipients,
-                                             pub_date__gt=one_week_ago).order_by("-id")
-    message_ids_to_use = list(reversed(recent_messages.values_list('id', flat=True)[0:1000]))
+    recent_messages = Message.objects.filter(recipient_id__in=recipients).order_by("-id")
+    last_kmessages = recent_messages.values_list('id', flat=True)[0:1000]
+    message_ids_to_use = list(reversed(last_kmessages))
     if len(message_ids_to_use) == 0:
         return
 
@@ -300,8 +300,9 @@ def add_new_user_history(user_profile, streams):
                                  flags=UserMessage.flags.read)
                      for message_id in message_ids_to_use
                      if message_id not in already_ids]
-
     UserMessage.objects.bulk_create(ums_to_create)
+    last_80 = [ms.message_id for ms in ums_to_create[-80:]]
+    UserMessage.objects.filter(message_id__in=last_80, user_profile=user_profile).update(flags=F('flags').bitand(~UserMessage.flags.read))
 
 # Does the processing for a new user account:
 # * Subscribes to default/invitation streams
@@ -1019,7 +1020,7 @@ def do_send_messages(messages_maybe_none):
         sender = message['message'].sender
         message_type = message_dict_no_markdown['type']
 
-        missed_message_userids = get_userids_for_missed_messages(
+        presence_idle_userids = get_active_presence_idle_userids(
             realm=sender.realm,
             sender_id=sender.id,
             message_type=message_type,
@@ -1032,7 +1033,7 @@ def do_send_messages(messages_maybe_none):
             message=message['message'].id,
             message_dict_markdown=message_dict_markdown,
             message_dict_no_markdown=message_dict_no_markdown,
-            missed_message_userids=missed_message_userids,
+            presence_idle_userids=presence_idle_userids,
         )
 
         users = [
@@ -1076,7 +1077,7 @@ def do_send_messages(messages_maybe_none):
         if (settings.ENABLE_FEEDBACK and settings.FEEDBACK_BOT and
                 message['message'].recipient.type == Recipient.PERSONAL):
 
-            feedback_bot_id = get_user_profile_by_email(email=settings.FEEDBACK_BOT).id
+            feedback_bot_id = get_system_bot(email=settings.FEEDBACK_BOT).id
             if feedback_bot_id in message['active_user_ids']:
                 queue_json_publish(
                     'feedback_messages',
@@ -1450,6 +1451,20 @@ def extract_recipients(s):
     recipients = [recipient.strip() for recipient in recipients]
     return list(set(recipient for recipient in recipients if recipient))
 
+def check_send_stream_message(sender, client, stream_name, topic, body):
+    # type: (UserProfile, Client, Text, Text, Text) -> int
+    addressee = Addressee.for_stream(stream_name, topic)
+    message = check_message(sender, client, addressee, body)
+
+    return do_send_messages([message])[0]
+
+def check_send_private_message(sender, client, receiving_user, body):
+    # type: (UserProfile, Client, UserProfile, Text) -> int
+    addressee = Addressee.for_user_profile(receiving_user)
+    message = check_message(sender, client, addressee, body)
+
+    return do_send_messages([message])[0]
+
 # check_send_message:
 # Returns the id of the sent message.  Has same argspec as check_message.
 def check_send_message(sender, client, message_type_name, message_to,
@@ -1539,6 +1554,9 @@ def check_message(sender, client, addressee,
     message_content = message_content_raw.rstrip()
     if len(message_content) == 0:
         raise JsonableError(_("Message must not be empty"))
+    if '\x00' in message_content:
+        raise JsonableError(_("Message must not contain null bytes"))
+
     message_content = truncate_body(message_content)
 
     if realm is None:
@@ -1638,6 +1656,7 @@ def _internal_prep_message(realm, sender, addressee, content):
     messages together as one database query.
     Call do_send_messages with a list of the return values of this method.
     """
+    # Remove any null bytes from the content
     if len(content) > MAX_MESSAGE_LENGTH:
         content = content[0:3900] + "\n\n[message was too long and has been truncated]"
 
@@ -1912,22 +1931,19 @@ def notify_subscriptions_added(user_profile, sub_pairs, stream_emails, no_log=Fa
                  subscriptions=payload)
     send_event(event, [user_profile.id])
 
-def get_peer_user_ids_for_stream_change(stream, altered_users, subscribed_users):
-    # type: (Stream, Iterable[UserProfile], Iterable[UserProfile]) -> Set[int]
+def get_peer_user_ids_for_stream_change(stream, altered_user_ids, subscribed_user_ids):
+    # type: (Stream, Iterable[int], Iterable[int]) -> Set[int]
     '''
-    altered_users is a list of users that we are adding/removing
-    subscribed_users is the list of already subscribed users
+    altered_user_ids is a list of user_ids that we are adding/removing
+    subscribed_user_ids is the list of already subscribed user_ids
 
     Based on stream policy, we notify the correct bystanders, while
     not notifying altered_users (who get subscribers via another event)
     '''
 
-    altered_user_ids = [user.id for user in altered_users]
-
     if stream.invite_only:
         # PRIVATE STREAMS
-        all_subscribed_ids = [user.id for user in subscribed_users]
-        return set(all_subscribed_ids) - set(altered_user_ids)
+        return set(subscribed_user_ids) - set(altered_user_ids)
 
     else:
         # PUBLIC STREAMS
@@ -1936,16 +1952,52 @@ def get_peer_user_ids_for_stream_change(stream, altered_users, subscribed_users)
         # structure to stay up-to-date.
         return set(active_user_ids(stream.realm_id)) - set(altered_user_ids)
 
-def query_all_subs_by_stream(streams):
-    # type: (Iterable[Stream]) -> Dict[int, List[UserProfile]]
-    all_subs = Subscription.objects.filter(recipient__type=Recipient.STREAM,
-                                           recipient__type_id__in=[stream.id for stream in streams],
-                                           user_profile__is_active=True,
-                                           active=True).select_related('recipient', 'user_profile')
+class UserLite(object):
+    '''
+    This is a lightweight object that we use for highly
+    optimized codepaths that sometimes process ~30k subscription
+    rows when bulk-adding streams for newly registered users.
 
-    all_subs_by_stream = defaultdict(list)  # type: Dict[int, List[UserProfile]]
-    for sub in all_subs:
-        all_subs_by_stream[sub.recipient.type_id].append(sub.user_profile)
+    This little wrapper is a lot less expensive than full-blown
+    UserProfile objects, but it lets the rest of the code work
+    with the nice object syntax.
+
+    Long term, we want to avoid sending around all of these emails,
+    so we can make this class go away and just deal with user_ids.
+    '''
+    def __init__(self, user_id, email):
+        # type: (int, Text) -> None
+        self.id = user_id
+        self.email = email
+
+def query_all_subs_by_stream(streams):
+    # type: (Iterable[Stream]) -> Dict[int, List[UserLite]]
+    all_subs = Subscription.objects.filter(
+        recipient__type=Recipient.STREAM,
+        recipient__type_id__in=[stream.id for stream in streams],
+        user_profile__is_active=True,
+        active=True
+    ).values(
+        'recipient__type_id',
+        'user_profile_id',
+        'user_profile__email',
+    ).order_by(
+        'recipient__type_id',
+    )
+
+    get_stream_id = itemgetter('recipient__type_id')
+
+    all_subs_by_stream = defaultdict(list)  # type: Dict[int, List[UserLite]]
+    for stream_id, rows in itertools.groupby(all_subs, get_stream_id):
+        users = [
+            UserLite(
+                user_id=row['user_profile_id'],
+                email=row['user_profile__email'],
+            )
+            for row in rows
+        ]
+        all_subs_by_stream[stream_id] = users
+
     return all_subs_by_stream
 
 def bulk_add_subscriptions(streams, users, from_stream_creation=False, acting_user=None):
@@ -2081,19 +2133,21 @@ def bulk_add_subscriptions(streams, users, from_stream_creation=False, acting_us
         if stream.realm.is_zephyr_mirror_realm and not stream.invite_only:
             continue
 
-        new_users = [user for user in users if (user.id, stream.id) in new_streams]
+        new_user_ids = [user.id for user in users if (user.id, stream.id) in new_streams]
+        subscribed_users = all_subs_by_stream[stream.id]
+        subscribed_user_ids = [u.id for u in subscribed_users]
 
         peer_user_ids = get_peer_user_ids_for_stream_change(
             stream=stream,
-            altered_users=new_users,
-            subscribed_users=all_subs_by_stream[stream.id]
+            altered_user_ids=new_user_ids,
+            subscribed_user_ids=subscribed_user_ids,
         )
 
         if peer_user_ids:
-            for added_user in new_users:
+            for new_user_id in new_user_ids:
                 event = dict(type="subscription", op="peer_add",
                              subscriptions=[stream.name],
-                             user_id=added_user.id)
+                             user_id=new_user_id)
                 send_event(event, peer_user_ids)
 
     return ([(user_profile, stream) for (user_profile, recipient_id, stream) in new_subs] +
@@ -2194,11 +2248,15 @@ def bulk_remove_subscriptions(users, streams, acting_user=None):
             continue
 
         altered_users = altered_user_dict[stream.id]
+        altered_user_ids = [u.id for u in altered_users]
+
+        subscribed_users = all_subs_by_stream[stream.id]
+        subscribed_user_ids = [u.id for u in subscribed_users]
 
         peer_user_ids = get_peer_user_ids_for_stream_change(
             stream=stream,
-            altered_users=altered_users,
-            subscribed_users=all_subs_by_stream[stream.id]
+            altered_user_ids=altered_user_ids,
+            subscribed_user_ids=subscribed_user_ids,
         )
 
         if peer_user_ids:
@@ -2896,7 +2954,8 @@ def do_mark_all_as_read(user_profile):
     ).extra(
         where=[UserMessage.where_unread()]
     )
-
+    msg_ids = msgs.order_by('-id').values_list('message_id')[80:]
+    msgs = UserMessage.objects.filter(message_id__in=msg_ids, user_profile=user_profile)
     count = msgs.update(
         flags=F('flags').bitor(UserMessage.flags.read)
     )
@@ -3132,8 +3191,10 @@ def do_update_embedded_data(user_profile, message, content, rendered_content):
 
 # We use transaction.atomic to support select_for_update in the attachment codepath.
 @transaction.atomic
-def do_update_message(user_profile, message, subject, propagate_mode, content, rendered_content):
-    # type: (UserProfile, Message, Optional[Text], str, Optional[Text], Optional[Text]) -> int
+def do_update_message(user_profile, message, subject, propagate_mode,
+                      content, rendered_content,
+                      prior_mention_user_ids, mention_user_ids):
+    # type: (UserProfile, Message, Optional[Text], str, Optional[Text], Optional[Text], Set[int], Set[int]) -> int
     event = {'type': 'update_message',
              # TODO: We probably want to remove the 'sender' field
              # after confirming it isn't used by any consumers.
@@ -3144,6 +3205,10 @@ def do_update_message(user_profile, message, subject, propagate_mode, content, r
         'user_id': user_profile.id,
     }  # type: Dict[str, Any]
     changed_messages = [message]
+
+    if message.recipient.type == Recipient.STREAM:
+        stream_id = message.recipient.type_id
+        event['stream_name'] = Stream.objects.get(id=stream_id).name
 
     # Set first_rendered_content to be the oldest version of the
     # rendered content recorded; which is the current version if the
@@ -3190,6 +3255,15 @@ def do_update_message(user_profile, message, subject, propagate_mode, content, r
         prev_content = edit_history_event['prev_content']
         if Message.content_has_attachment(prev_content) or Message.content_has_attachment(message.content):
             check_attachment_reference_change(prev_content, message)
+
+        # TODO: We may want a slightly leaner of this function for updates.
+        info = get_recipient_info(message.recipient,
+                                  message.sender_id)
+        event['push_notify_user_ids'] = list(info['push_notify_user_ids'])
+        event['stream_push_user_ids'] = list(info['stream_push_user_ids'])
+        event['prior_mention_user_ids'] = list(prior_mention_user_ids)
+        event['mention_user_ids'] = list(mention_user_ids)
+        event['presence_idle_userids'] = filter_presence_idle_userids(info['active_user_ids'])
 
     if subject is not None:
         orig_subject = message.topic_name()
@@ -3458,8 +3532,18 @@ def gather_subscriptions(user_profile):
 
     return (subscribed, unsubscribed)
 
-def get_userids_for_missed_messages(realm, sender_id, message_type, active_user_ids, user_flags):
+def get_active_presence_idle_userids(realm, sender_id, message_type, active_user_ids, user_flags):
     # type: (Realm, int, str, Set[int], Dict[int, List[str]]) -> List[int]
+    '''
+    Given a list of active_user_ids, we build up a subset
+    of those users who fit these criteria:
+
+        * They are likely to need notifications (either due
+          to mentions or being PM'ed).
+        * They are no longer "present" according to the
+          UserPresence table.
+    '''
+
     if realm.presence_disabled:
         return []
 
@@ -3473,9 +3557,9 @@ def get_userids_for_missed_messages(realm, sender_id, message_type, active_user_
         if mentioned or private_message:
             user_ids.add(user_id)
 
-    return get_idle_userids(user_ids)
+    return filter_presence_idle_userids(user_ids)
 
-def get_idle_userids(user_ids):
+def filter_presence_idle_userids(user_ids):
     # type: (Set[int]) -> List[int]
     if not user_ids:
         return []
